@@ -157,6 +157,36 @@ for i in range(20):
 print(f"\nResponse time (private message -> delivery confirmation), 20 tries:")
 print(f"      average {sum(times) / len(times):.2f} ms, slowest {max(times):.2f} ms")
 
+# --- Offline messages ---
+isha.sock.close()
+jay.next_of("user_left")
+jay.send({"type": "private", "to": "Isha", "text": "Call me when you're back"})
+st = jay.next_of("stored")
+check("Message to an offline user is saved", "Jay gets 'stored' for Isha",
+      st and st["to"] == "Isha")
+jay.send({"type": "private", "to": "Ghost", "text": "hello?"})
+e = jay.next_of("error")
+check("Message to a name that never joined is rejected", "error 'unknown_recipient'",
+      e and e["code"] == "unknown_recipient")
+isha = TestClient()
+isha.send({"type": "join", "username": "Isha"})
+j = isha.next_of("joined")
+m = isha.next_of("private")
+check("Offline message is delivered when they come back",
+      "Isha rejoins, is told 1 is waiting, and receives it marked offline",
+      j and j.get("waiting") == 1 and m and m["text"] == "Call me when you're back"
+      and m.get("offline") is True and m["from"] == "Jay")
+isha.send({"type": "read", "id": m["id"]})
+r = jay.next_of("read_receipt")
+check("Read receipt works for offline messages", "Jay is told 'read by Isha'",
+      r and r["by"] == "Isha" and r["id"] == m["id"])
+isha.sock.close()
+isha = TestClient()
+isha.send({"type": "join", "username": "Isha"})
+j = isha.next_of("joined")
+check("Offline messages are delivered only once", "rejoining again: 0 waiting",
+      j and j.get("waiting") == 0)
+
 jay.sock.close()
 isha.sock.close()
 print(f"\n{sum(results)} of {len(results)} tests passed")

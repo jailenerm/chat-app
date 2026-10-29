@@ -46,11 +46,14 @@ def show(msg, sock):
     if kind == "public":
         print(f"[{t}] {msg['from']}: {msg['text']}")
     elif kind == "private":
-        print(f"[{t}] (private) {msg['from']} -> you: {msg['text']}")
+        note = ", sent while you were offline" if msg.get("offline") else ""
+        print(f"[{t}] (private{note}) {msg['from']} -> you: {msg['text']}")
         # We just showed it on screen, so tell the sender it was read
         send_message(sock, {"type": "read", "id": msg["id"]})
     elif kind == "delivered":
         print(f"  [delivered to {msg['to']}]")
+    elif kind == "stored":
+        print(f"  [{msg['to']} is offline. Saved, and will be delivered when they come back]")
     elif kind == "read_receipt":
         print(f"  [read by {msg['by']} at {t}]")
     elif kind == "users":
@@ -112,6 +115,8 @@ def main():
         print("The server closed the connection.")
         return
     print(f"Welcome, {joined['username']}! Online: {', '.join(joined['users'])}")
+    if joined.get("waiting"):
+        print(f"You have {joined['waiting']} message(s) from while you were away:")
     print("Type /help for commands.")
 
     receiver = threading.Thread(target=receive_loop, args=(reader, sock), daemon=True)
