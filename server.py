@@ -16,6 +16,9 @@ How it works:
   - Every private message gets an "id". When the recipient's client shows
     it, it sends back {"type": "read", "id": ...}, and the server passes a
     read receipt to the original sender.
+  - Offline messages: if you send a private message to someone who has been
+    online before but isn't right now, the server saves it in their mailbox
+    and delivers it the next time they join with that username.
 """
 
 import socket
@@ -30,7 +33,13 @@ PORT = 5050
 registry = {}                       # username -> Connection
 registry_lock = threading.Lock()
 
-# Read receipts: private message id -> (sender Connection, recipient username)
+# Offline messages (protected by registry_lock, together with the registry,
+# so a user can't come online "in between" a check and a save):
+known_users = {}    # lowercase name -> name, for everyone who has ever joined
+mailboxes = {}      # lowercase name -> list of saved private messages
+MAX_OFFLINE = 50    # most messages one offline user can have waiting
+
+# Read receipts: private message id -> (sender username, recipient username)
 pending_reads = {}
 next_message_id = 1
 messages_lock = threading.Lock()
@@ -41,14 +50,19 @@ def now():
     return datetime.now().strftime("%I:%M %p").lstrip("0")
 
 
-def new_private_id(sender, recipient_name):
-    """Give a private message a unique id and remember who sent it."""
+def new_message_id():
+    """Give a private message a unique id."""
     global next_message_id
     with messages_lock:
         msg_id = next_message_id
         next_message_id += 1
-        pending_reads[msg_id] = (sender, recipient_name)
     return msg_id
+
+
+def await_read(msg_id, sender_name, recipient_name):
+    """Remember a delivered private message until its read receipt comes back."""
+    with messages_lock:
+        pending_reads[msg_id] = (sender_name, recipient_name)
 
 
 class Connection:
@@ -77,18 +91,23 @@ def log(text):
 # ---------- helpers that touch the shared registry ----------
 
 def register(conn, username):
-    """Try to claim a username. Returns an error code, or None on success."""
+    """
+    Try to claim a username.
+    Returns (error code or None, list of offline messages waiting for them).
+    """
     if not isinstance(username, str) or not username.strip():
-        return "invalid_name"
+        return "invalid_name", []
     username = username.strip()
     if len(username) > 20 or " " in username:
-        return "invalid_name"
+        return "invalid_name", []
     with registry_lock:
         if username.lower() in (name.lower() for name in registry):
-            return "name_taken"
+            return "name_taken", []
         registry[username] = conn
         conn.username = username
-    return None
+        known_users[username.lower()] = username
+        waiting = mailboxes.pop(username.lower(), [])
+    return None, waiting
 
 
 def unregister(conn):
@@ -148,15 +167,35 @@ def handle_message(conn, msg):
         if not isinstance(to, str) or not isinstance(text, str) or not text:
             error(conn, "malformed", "private messages need 'to' and 'text' fields")
             return True
-        target = find_user(to)
+        msg_id = new_message_id()
+        stored = None
+        with registry_lock:
+            target = next((c for n, c in registry.items() if n.lower() == to.lower()), None)
+            if target is None and to.lower() in known_users:
+                # They've been here before but are offline: save it for later
+                box = mailboxes.setdefault(to.lower(), [])
+                if len(box) < MAX_OFFLINE:
+                    stored = {"type": "private", "id": msg_id, "from": conn.username,
+                              "to": known_users[to.lower()], "text": text,
+                              "time": now(), "offline": True}
+                    box.append(stored)
+                else:
+                    stored = "full"
         if target is None:
-            error(conn, "unknown_recipient", f"No user named '{to}' is online")
-            log(f"[private] {conn.username} -> {to}: FAILED (unknown recipient)")
+            if stored == "full":
+                error(conn, "mailbox_full", f"{to}'s offline mailbox is full")
+                log(f"[private #{msg_id}] {conn.username} -> {to}: FAILED (mailbox full)")
+            elif stored:
+                conn.send({"type": "stored", "id": msg_id, "to": stored["to"], "text": text})
+                log(f"[private #{msg_id}] {conn.username} -> {stored['to']}: {text}  (saved, recipient offline)")
+            else:
+                error(conn, "unknown_recipient", f"No user named '{to}' has ever joined")
+                log(f"[private] {conn.username} -> {to}: FAILED (unknown recipient)")
             return True
         if target is conn:
             error(conn, "malformed", "You can't send a private message to yourself")
             return True
-        msg_id = new_private_id(conn, target.username)
+        await_read(msg_id, conn.username, target.username)
         ok = target.send({"type": "private", "id": msg_id, "from": conn.username,
                           "to": target.username, "text": text, "time": now()})
         if ok:
@@ -181,12 +220,13 @@ def handle_message(conn, msg):
         if entry is None:
             error(conn, "unknown_message", f"No unread private message with id {msg_id}")
             return True
-        sender = entry[0]
-        if sender.send({"type": "read_receipt", "id": msg_id,
-                        "by": conn.username, "time": now()}):
-            log(f"[read #{msg_id}] {conn.username} read {sender.username}'s message")
+        sender_name = entry[0]
+        sender = find_user(sender_name)
+        if sender and sender.send({"type": "read_receipt", "id": msg_id,
+                                   "by": conn.username, "time": now()}):
+            log(f"[read #{msg_id}] {conn.username} read {sender_name}'s message")
         else:
-            log(f"[read #{msg_id}] {conn.username} read it, but the sender has left")
+            log(f"[read #{msg_id}] {conn.username} read {sender_name}'s message, but {sender_name} is offline")
 
     elif kind == "list":
         conn.send({"type": "users", "users": online_users()})
@@ -226,17 +266,22 @@ def handle_client(sock, addr):
                 if msg.get("type") != "join":
                     error(conn, "not_joined", "Send a 'join' message with a username first")
                     continue
-                problem = register(conn, msg.get("username"))
+                problem, waiting = register(conn, msg.get("username"))
                 if problem == "name_taken":
                     error(conn, "name_taken", f"'{msg.get('username')}' is already taken")
                 elif problem == "invalid_name":
                     error(conn, "invalid_name", "Usernames must be 1-20 characters with no spaces")
                 else:
                     conn.send({"type": "joined", "username": conn.username,
-                               "users": online_users()})
+                               "users": online_users(), "waiting": len(waiting)})
                     broadcast({"type": "user_joined", "username": conn.username,
                                "time": now()}, exclude=conn)
                     log(f"[join] {conn.username} (online: {', '.join(online_users())})")
+                    for saved in waiting:      # deliver offline messages
+                        await_read(saved["id"], saved["from"], conn.username)
+                        conn.send(saved)
+                        log(f"[private #{saved['id']}] {saved['from']} -> {conn.username}: "
+                            f"{saved['text']}  (delivered from mailbox)")
                 continue
 
             # Step 2: normal chat messages
@@ -245,9 +290,9 @@ def handle_client(sock, addr):
     finally:
         # Runs on /quit, on a crash, on a closed window, on lost Wi-Fi...
         # so the online list always stays correct.
-        with messages_lock:   # forget read receipts this user can no longer send or get
+        with messages_lock:   # they left, so they can't send read receipts anymore
             for mid in [m for m, (snd, rcp) in pending_reads.items()
-                        if snd is conn or rcp == conn.username]:
+                        if rcp == conn.username]:
                 del pending_reads[mid]
         if unregister(conn):
             broadcast({"type": "user_left", "username": conn.username, "time": now()})
