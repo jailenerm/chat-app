@@ -37,31 +37,21 @@ PORT = 5050
 registry = {}                       # username -> Connection
 registry_lock = threading.Lock()
 
-# Offline messages (protected by registry_lock, together with the registry,
-# so a user can't come online "in between" a check and a save):
-known_users = {}    # lowercase name -> name, for everyone who has ever joined
-mailboxes = {}      # lowercase name -> list of saved private messages
-MAX_OFFLINE = 50    # most messages one offline user can have waiting
-DATA_FILE = "chat_data.json"   # where known users and mailboxes are saved
+known_users = {}    
+mailboxes = {}     
+MAX_OFFLINE = 50    
+DATA_FILE = "chat_data.json"   
 
-# Read receipts: private message id -> (sender username, recipient username)
 pending_reads = {}
 next_message_id = 1
 messages_lock = threading.Lock()
 
 
 def now():
-    """The current time, e.g. '2:15 PM'. Added by the server to every message."""
     return datetime.now().strftime("%I:%M %p").lstrip("0")
 
 
 def save_data():
-    """
-    Write known users and mailboxes to disk.
-    Call this while holding registry_lock, so the data can't change mid-save.
-    We write to a temporary file first and then swap it in, so a crash in the
-    middle of saving can never leave a half-written, broken file behind.
-    """
     data = {"known_users": known_users, "mailboxes": mailboxes,
             "next_message_id": next_message_id}
     tmp = DATA_FILE + ".tmp"
@@ -71,7 +61,6 @@ def save_data():
 
 
 def load_data():
-    """Read saved users and mailboxes when the server starts."""
     global next_message_id
     if not os.path.exists(DATA_FILE):
         return
@@ -83,14 +72,12 @@ def load_data():
         return
     known_users.update(data.get("known_users", {}))
     mailboxes.update(data.get("mailboxes", {}))
-    # keep numbering after the saved messages so ids are never reused
     next_message_id = max(next_message_id, data.get("next_message_id", 1))
     waiting = sum(len(box) for box in mailboxes.values())
     log(f"Loaded {len(known_users)} known users and {waiting} saved offline message(s).")
 
 
 def new_message_id():
-    """Give a private message a unique id."""
     global next_message_id
     with messages_lock:
         msg_id = next_message_id
@@ -99,13 +86,11 @@ def new_message_id():
 
 
 def await_read(msg_id, sender_name, recipient_name):
-    """Remember a delivered private message until its read receipt comes back."""
     with messages_lock:
         pending_reads[msg_id] = (sender_name, recipient_name)
 
 
 class Connection:
-    """One connected client: its socket, its name, and its own send lock."""
 
     def __init__(self, sock, addr):
         self.sock = sock
@@ -114,7 +99,6 @@ class Connection:
         self.send_lock = threading.Lock()
 
     def send(self, msg):
-        """Send one message to this client. Returns False if it failed."""
         try:
             with self.send_lock:
                 send_message(self.sock, msg)
@@ -127,13 +111,8 @@ def log(text):
     print(text, flush=True)
 
 
-# ---------- helpers that touch the shared registry ----------
-
 def register(conn, username):
-    """
-    Try to claim a username.
-    Returns (error code or None, list of offline messages waiting for them).
-    """
+    
     if not isinstance(username, str) or not username.strip():
         return "invalid_name", []
     username = username.strip()
@@ -151,7 +130,6 @@ def register(conn, username):
 
 
 def unregister(conn):
-    """Remove a user. Safe to call more than once."""
     with registry_lock:
         if conn.username and registry.get(conn.username) is conn:
             del registry[conn.username]
@@ -173,12 +151,11 @@ def find_user(name):
 
 
 def broadcast(msg, exclude=None):
-    """Send to everyone. Returns how many clients received it."""
     with registry_lock:
         targets = [c for c in registry.values() if c is not exclude]
     delivered = 0
-    for c in targets:              # send OUTSIDE the lock so one slow client
-        if c.send(msg):            # can't freeze the whole server
+    for c in targets:             
+        if c.send(msg):            
             delivered += 1
     return delivered
 
@@ -187,10 +164,8 @@ def error(conn, code, message):
     conn.send({"type": "error", "code": code, "message": message})
 
 
-# ---------- handling one client ----------
 
 def handle_message(conn, msg):
-    """Handle one message from a joined user. Returns False to disconnect."""
     kind = msg.get("type")
 
     if kind == "public":
@@ -329,9 +304,7 @@ def handle_client(sock, addr):
             if not handle_message(conn, msg):
                 break
     finally:
-        # Runs on /quit, on a crash, on a closed window, on lost Wi-Fi...
-        # so the online list always stays correct.
-        with messages_lock:   # they left, so they can't send read receipts anymore
+        with messages_lock:  
             for mid in [m for m, (snd, rcp) in pending_reads.items()
                         if rcp == conn.username]:
                 del pending_reads[mid]
