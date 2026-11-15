@@ -19,8 +19,12 @@ How it works:
   - Offline messages: if you send a private message to someone who has been
     online before but isn't right now, the server saves it in their mailbox
     and delivers it the next time they join with that username.
+  - Known users and mailboxes are saved to chat_data.json, so saved messages
+    survive the server being stopped and restarted.
 """
 
+import json
+import os
 import socket
 import threading
 from datetime import datetime
@@ -38,6 +42,7 @@ registry_lock = threading.Lock()
 known_users = {}    # lowercase name -> name, for everyone who has ever joined
 mailboxes = {}      # lowercase name -> list of saved private messages
 MAX_OFFLINE = 50    # most messages one offline user can have waiting
+DATA_FILE = "chat_data.json"   # where known users and mailboxes are saved
 
 # Read receipts: private message id -> (sender username, recipient username)
 pending_reads = {}
@@ -48,6 +53,40 @@ messages_lock = threading.Lock()
 def now():
     """The current time, e.g. '2:15 PM'. Added by the server to every message."""
     return datetime.now().strftime("%I:%M %p").lstrip("0")
+
+
+def save_data():
+    """
+    Write known users and mailboxes to disk.
+    Call this while holding registry_lock, so the data can't change mid-save.
+    We write to a temporary file first and then swap it in, so a crash in the
+    middle of saving can never leave a half-written, broken file behind.
+    """
+    data = {"known_users": known_users, "mailboxes": mailboxes,
+            "next_message_id": next_message_id}
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, DATA_FILE)
+
+
+def load_data():
+    """Read saved users and mailboxes when the server starts."""
+    global next_message_id
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"Could not read {DATA_FILE} ({e}). Starting with no saved data.")
+        return
+    known_users.update(data.get("known_users", {}))
+    mailboxes.update(data.get("mailboxes", {}))
+    # keep numbering after the saved messages so ids are never reused
+    next_message_id = max(next_message_id, data.get("next_message_id", 1))
+    waiting = sum(len(box) for box in mailboxes.values())
+    log(f"Loaded {len(known_users)} known users and {waiting} saved offline message(s).")
 
 
 def new_message_id():
@@ -107,6 +146,7 @@ def register(conn, username):
         conn.username = username
         known_users[username.lower()] = username
         waiting = mailboxes.pop(username.lower(), [])
+        save_data()
     return None, waiting
 
 
@@ -179,6 +219,7 @@ def handle_message(conn, msg):
                               "to": known_users[to.lower()], "text": text,
                               "time": now(), "offline": True}
                     box.append(stored)
+                    save_data()
                 else:
                     stored = "full"
         if target is None:
@@ -304,6 +345,7 @@ def handle_client(sock, addr):
 
 
 def main():
+    load_data()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
