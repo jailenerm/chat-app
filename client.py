@@ -2,7 +2,7 @@
 client.py - the chat client (what each user runs).
 
 Run:  python3 client.py                  (server on this same computer)
-      python3 client.py 192.168.1.20     (server on another computer)
+      python3 client.py 52.162.234.206     (server on another computer)
 
 Type a message and press Enter to send it to everyone.
 Commands:
@@ -21,8 +21,7 @@ from protocol import MessageReader, send_message as _send_message
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 PORT = 5050
 
-# Two threads send on this socket (typing, and automatic read receipts),
-# so a lock makes sure their messages never get mixed together.
+
 send_lock = threading.Lock()
 
 
@@ -69,7 +68,6 @@ def show(msg, sock):
 
 
 def receive_loop(reader, sock):
-    """Runs in its own thread: prints messages as soon as they arrive."""
     while True:
         try:
             msg = reader.read_message()
@@ -85,7 +83,6 @@ def receive_loop(reader, sock):
 
 
 def join(sock, reader):
-    """Keep asking for a username until the server accepts one."""
     while True:
         name = input("Pick a username: ").strip()
         send_message(sock, {"type": "join", "username": name})
